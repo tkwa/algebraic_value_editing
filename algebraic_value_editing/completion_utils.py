@@ -283,7 +283,6 @@ def gen_using_activation_additions(
     )
     for key,value in extra_hooks.items():
         hook_fns[key] = hook_fns.get(key,[]) + [value]
-
     return gen_using_hooks(model=model, hook_fns=hook_fns, log=False, **kwargs)
 
 

@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from einops import einsum, rearrange, repeat
 from transformer_lens.HookedTransformer import HookedTransformer
+from typing import Callable
 
 from algebraic_value_editing import completion_utils, utils, hook_utils 
 import overwriting_hook_utils
@@ -27,46 +28,36 @@ model: HookedTransformer = HookedTransformer.from_pretrained(
 _ = model.to("cuda")
 
 # %%
-# #boilerplate example code from the original file
-# activation_additions: List[ActivationAddition] = [
-#     *get_x_vector(
-#         prompt1="I",
-#         prompt2="Hate",
-#         coeff=0.36,
-#         act_name=6,
-#         model=model,
-#         pad_method="tokens_right",
-#     ),
-# ]
-
-# completion_utils.print_n_comparisons(
-#     prompt="I am the",
-#     num_comparisons=5,
-#     model=model,
-#     activation_additions=activation_additions,
-#     seed=0,
-#     temperature=1,
-#     freq_penalty=1,
-#     top_p=0.3,
-# )
-# %%
-#returns a tensor of shape (50257,) with pre-softmax logits 
-#from applying (prompt1-prompt2) at a strength of x to baseline_prompt at the given layer
 def logits_from_shifted_prompt(baseline_prompt, prompt1, prompt2,x,layer,
-                               model=model,overwriting = 'none',token_index=-1):
-    extra_hooks = {}
+                               model=model,
+                               overwriting:str|Callable[[str],bool] = 'none',
+                               extra_extra_hooks = None,
+                               token_index=-1,
+                               **kwargs):
+    '''
+    overwriting: can be 'none', 'attention', 'mlp', or a function that takes a layer name and returns whether to overwrite it
+    returns a tensor of shape (50257,) with pre-softmax logits 
+    from applying (prompt1-prompt2) at a strength of x to baseline_prompt at the given layer
+    '''
+    
     if overwriting == 'attention':
-        extra_hooks = overwriting_hook_utils.generate_overwriting_hook_fns(
-            model = model,
-            baseline_prompt = baseline_prompt,
-            act_name = (lambda layer_name: 'hook_attn_out' in layer_name)
-        )
+        overwriting = (lambda layer_name: 'hook_attn_out' in layer_name)
     elif overwriting == 'mlp':
+        overwriting = (lambda layer_name: 'hook_mlp_out' in layer_name)
+
+
+    assert not (extra_extra_hooks is not None and overwriting == 'mlp'), "Trying to ablate MLPs and also overwrite them"
+    extra_hooks = {}
+
+    if overwriting != 'none':
         extra_hooks = overwriting_hook_utils.generate_overwriting_hook_fns(
             model = model,
             baseline_prompt = baseline_prompt,
-            act_name = (lambda layer_name: 'hook_mlp_out' in layer_name)
+            act_name = overwriting
         )
+    if extra_extra_hooks is not None:
+        extra_hooks.update(extra_extra_hooks)
+
     activation_additions: List[ActivationAddition] = [
         *get_x_vector(
             prompt1=prompt1,
@@ -91,13 +82,41 @@ def logits_from_shifted_prompt(baseline_prompt, prompt1, prompt2,x,layer,
         freq_penalty=1,
         top_p=0.3,
         include_logits = True,
+        **kwargs
     )
     mod_logits = mod_df['logits'].iloc[0][token_index]
     return t.tensor(mod_logits)
 #same as above, but returns a tensor of shape (49,num_tokens,1600) with each res)idual stream
 #(49 because we have pre-layer-0 and post-layer-47)
 def modified_cache_tensor(baseline_prompt, prompt1, prompt2,x,layer,
-                               model=model,token_index=-1):
+                        model=model,
+                        overwriting:str|Callable[[str],bool] = 'none',
+                        extra_extra_hooks = None,
+                        ):
+    '''
+    overwriting: can be 'none', 'attention', 'mlp', or a function that takes a layer name and returns whether to overwrite it
+    returns a tensor of shape (50257,) with pre-softmax logits 
+    from applying (prompt1-prompt2) at a strength of x to baseline_prompt at the given layer
+    '''
+    
+    if overwriting == 'attention':
+        overwriting = (lambda layer_name: 'hook_attn_out' in layer_name)
+    elif overwriting == 'mlp':
+        overwriting = (lambda layer_name: 'hook_mlp_out' in layer_name)
+
+
+    assert not (extra_extra_hooks is not None and overwriting == 'mlp'), "Trying to ablate MLPs and also overwrite them"
+    extra_hooks = {}
+
+    if overwriting != 'none':
+        extra_hooks = overwriting_hook_utils.generate_overwriting_hook_fns(
+            model = model,
+            baseline_prompt = baseline_prompt,
+            act_name = overwriting
+        )
+    if extra_extra_hooks is not None:
+        extra_hooks.update(extra_extra_hooks)
+
     activation_additions: List[ActivationAddition] = [
         *get_x_vector(
             prompt1=prompt1,
@@ -108,7 +127,6 @@ def modified_cache_tensor(baseline_prompt, prompt1, prompt2,x,layer,
             pad_method="tokens_right",
         ),
     ]
-
     mod_df = completion_utils.gen_using_activation_additions(
         prompt_batch=[baseline_prompt],
         tokens_to_generate = 0, #just looking at the next token
@@ -118,9 +136,10 @@ def modified_cache_tensor(baseline_prompt, prompt1, prompt2,x,layer,
         res_stream_slice=slice(None),
         seed=0,
         temperature=1,
-        freq_penalty=1,
+        freq_penalty=1, 
         top_p=0.3,
         include_full_cache = True,
+        extra_hooks= extra_hooks,
     )
     return mod_df['full_cache'].iloc[0]
 
@@ -171,7 +190,6 @@ def track_differences(baseline_prompt,prompt1,prompt2,spike_center, spike_width,
                      f"{prompt1} - {prompt2} at layer 6")
     plt.show()
 
-
 def get_logits_by_intervention_layer(model,baseline_prompt,prompt1,prompt2, xrange,
                                      use_tqdm = True, n_layers = 48,token_index=-1):
     """
@@ -186,7 +204,6 @@ def get_logits_by_intervention_layer(model,baseline_prompt,prompt1,prompt2, xran
                                                          model=model,token_index=token_index)
     return output
 
-# %%
 def entropy(logits):
     post_softmax = t.nn.functional.softmax(logits,dim=-1)
     return -(post_softmax * t.log(post_softmax)).sum(dim=-1)
@@ -209,6 +226,7 @@ track_differences(baseline_prompt,prompt1,prompt2,spike_center = 0.18, spike_wid
 # %%
 """Measuring the angle between small differences and large ones
 """
+target_token_index = 1
 all_caches = []
 for x in [0,0.13,0.1508,0.17,0.1]:
     mct = modified_cache_tensor(baseline_prompt,prompt1,prompt2,x=x,layer=6)[:,target_token_index]
@@ -275,10 +293,12 @@ def detect_spike(lambda_range, quantity, use='entropy'):
     argmax_slope = t.abs(diffs).argmax()
     return lambda_range[argmax_slope].item() - x_res / 2, diffs[argmax_slope].item()
 
+lambda_range = t.arange(0.,1,0.02) #vector scaling coefficient
 detect_spike(lambda_range,entropy(all_logits))
 
 
 # %%
+layer = 6
 baseline_prompt = "I"
 baseline_logits =t.tensor(completion_utils.gen_using_model(
     model = model,
@@ -296,20 +316,23 @@ print(f"Using prompts of length {actual_steerprompt_length}")
 # assert len(model.tokenizer.tokenize(prompt1)) == intended_prompt_length,model.tokenizer.tokenize(prompt1)
 # assert len(model.tokenizer.tokenize(prompt2)) == intended_prompt_length,model.tokenizer.tokenize(prompt2)
 
+ablate = True
+maybe_ablate_hooks = ({} if not ablate else extra_ablation_hooks)
 logit_list = []
 lambda_range = t.arange(0.,1,0.02) #vector scaling coefficient
 for x in tqdm(lambda_range):
     logit_list.append(logits_from_shifted_prompt(
-        baseline_prompt, prompt1, prompt2,x=x,layer=layer))
+        baseline_prompt, prompt1, prompt2,x=x,layer=layer,
+        extra_extra_hooks=maybe_ablate_hooks))
 all_logits = t.stack(logit_list,dim=0)
 all_logits.shape #should be (50,50257)
 
 # %%
-
-
-def logit_diff_plot(lambda_range:t.Tensor,
+def logit_diff_multiplot(lambda_range:t.Tensor,
                     all_logits:t.Tensor, # (lambda_range, vocab_size)
-                    tokens_of_interest:list[str], use_logprobs=False) -> None:
+                    tokens_of_interest:list[str], 
+                    layer=6, use_logprobs=False,
+                    show_spike = True) -> None:
     """
     Plots logit difference for 4 tokens, entropy, and KL divergence
     as a function of the steering coefficient lambda.
@@ -338,23 +361,80 @@ def logit_diff_plot(lambda_range:t.Tensor,
     plt.plot(lambda_range,entropy(all_logits))
     plt.title("Entropy")
     plt.xlabel("lambda")
-    line_x, spike_slope = detect_spike(lambda_range,entropy(all_logits))
-    min_val, max_val = plt.ylim()
-    plt.plot([line_x,line_x],[min_val,max_val],color='red')
-    plt.text(line_x, (max_val + min_val)/2, f"spike at {line_x:.5f}\n with slope {spike_slope:.2f}")
+    if show_spike:
+        line_x, spike_slope = detect_spike(lambda_range,entropy(all_logits))
+        min_val, max_val = plt.ylim()
+        plt.plot([line_x,line_x],[min_val,max_val],color='red')
+        plt.text(line_x, (max_val + min_val)/2, f"spike at {line_x:.5f}\n with slope {spike_slope:.2f}")
     plt.subplot(2,3,6)
     plt.plot(lambda_range,kl_divergence(all_logits,baseline_logits))
     plt.title("KL Divergence")
     plt.xlabel("lambda")
     #add an overall title
-    plt.suptitle(f"""{logit_or_logprob}s for baseline prompt: "{baseline_prompt}"\nIntervening with lambda*(|{prompt1}| - |{prompt2}|). (length={actual_steerprompt_length})""")
+    plt.suptitle(f"""{logit_or_logprob}s for baseline prompt: "{baseline_prompt}"\nIntervening with lambda*(|{prompt1}| - |{prompt2}|) at layer {layer}. (length={actual_steerprompt_length})""")
     plt.show()
 
-tokens_of_interest = [' worst',' best',' only',' apple']
-logit_diff_plot(lambda_range,all_logits,tokens_of_interest)
+tokens_of_interest = [' am',' like',' think',' apple']
+logit_diff_multiplot(lambda_range,all_logits,tokens_of_interest,use_logprobs = False, show_spike=False)
 
 # %%
-logit_diff_plot(lambda_range,all_logits,tokens_of_interest,use_logprobs=True)
+#Figuring out some neurons to ablate for experimentally reducing the spike
+eot_scaling_neurons = overwriting_hook_utils.eot_scaling_neurons(model)
+extra_ablation_hooks = overwriting_hook_utils.generate_neuron_ablation_hook_fns(
+    model = model,
+    layer_to_neuron_indices = eot_scaling_neurons,
+    token_index = 1,
+)
+# %%
+"""
+Now collecting caches for:
+* baseline prompt
+* modified prompt after spike
+* modified prompt with ablations
+"""
+layer = 6
+baseline_prompt = "I"
+baseline_logits =t.tensor(completion_utils.gen_using_model(
+    model = model,
+    prompt_batch=[baseline_prompt],
+    tokens_to_generate=0,
+    seed = 0, #this doesn't matter since we look at logits
+    include_logits=True,
+)['logits'].iloc[0][-1]) #taking just the last token
+# variant_prompt = "I love you because you are the"
+prompt1 = "<|endoftext|>"
+prompt2 = "I"
+baseline_cache = modified_cache_tensor(baseline_prompt,prompt1,prompt2,x=0,layer=6)
+spike_cache = modified_cache_tensor(baseline_prompt,prompt1,prompt2,x=0.25,layer=6)
+ablated_zero_cache = modified_cache_tensor(baseline_prompt,prompt1,prompt2,x=0.,layer=6,
+                                        extra_extra_hooks=extra_ablation_hooks)
+ablated_cache = modified_cache_tensor(baseline_prompt,prompt1,prompt2,x=0.25,layer=6,
+                                        extra_extra_hooks=extra_ablation_hooks)
+# %%
+#plotting distances from baseline by layer
+target_token_index = -1
+baseline_norms = t.norm(baseline_cache[:,target_token_index],dim=-1)
+plt.figure(figsize=(8,5))
+for i,changed_cache in enumerate([spike_cache,ablated_zero_cache,ablated_cache]):
+    distances = t.norm(changed_cache[:,target_token_index]-baseline_cache[:,target_token_index],dim=-1)/baseline_norms
+    print(distances.shape)
+    plt.plot(distances,label = ['spike','ablated zero','ablated'][i])
+plt.legend()
+plt.yscale('log')
+plt.show()
+
+
+
+# %%
+#attempting neuron ablation
+logit_list = []
+lambda_range = t.arange(0.,1,0.02) #vector scaling coefficient
+for x in tqdm(lambda_range):
+    logit_list.append(logits_from_shifted_prompt(
+        baseline_prompt, prompt1, prompt2,x=x,layer=layer,
+        extra_extra_hooks=extra_ablation_hooks))
+all_logits = t.stack(logit_list,dim=0)
+logit_diff_multiplot(lambda_range,all_logits,tokens_of_interest,use_logprobs=True)
 
 # %%
 #Look at which tokens get upweighted by the spike
@@ -383,7 +463,7 @@ for tok in tokens_of_interest:
     plt.imshow(plot_values.T,origin='lower',aspect='auto')
     plt.colorbar()
     plt.title(f"Logit of |{tok}|")
-    plt.xlabel("layer")
+    plt.xlabel("Intervention layer")
     plt.ylabel("lambda")
     plt.show()
 
@@ -458,3 +538,24 @@ mod_df = completion_utils.gen_using_activation_additions(
 mod_logits = mod_df['logits'].iloc[0][-1]
 # %%
 
+def mlp_by_layer_plot():
+    """
+    Runs logits_from_shifted_prompt when ablating the layers that add lots of norm (roughly 6 to 20)
+    to test whether there's still a spike.
+    We make a logit_diff_multiplot...
+    """
+    def overwriting(layer_name):
+        parts = layer_name.split('.')
+        return 'hook_attn_out' in layer_name \
+            or 'hook_mlp_out' in layer_name and False # 6 < int(parts[1]) < 20
+    
+    lambda_range = t.arange(0.,1,0.02) #vector scaling coefficient
+    logit_list = []
+    for x in tqdm(lambda_range):
+        logit_list.append(logits_from_shifted_prompt(
+            baseline_prompt, prompt1, prompt2,x=x,layer=layer))
+    logits_by_x = t.stack(logit_list,dim=0)
+    print(logits_by_x.shape) #should be (50,50257)
+    logit_diff_multiplot(lambda_range,logits_by_x,tokens_of_interest,use_logprobs=True)
+mlp_by_layer_plot()
+# %%
